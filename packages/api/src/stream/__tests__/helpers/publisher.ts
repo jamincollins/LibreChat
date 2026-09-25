@@ -4,6 +4,7 @@ export interface MockPublisher {
   expire: jest.Mock;
   ttl: jest.Mock;
   get: jest.Mock;
+  set: jest.Mock;
   del: jest.Mock;
   eval: jest.Mock;
 }
@@ -11,6 +12,7 @@ export interface MockPublisher {
 /** Mock publisher with Redis command simulation for atomic sequence counters */
 export function createMockPublisher(): MockPublisher {
   const counters = new Map<string, number>();
+  const values = new Map<string, string>();
   const ttls = new Map<string, number>();
   const publisher: MockPublisher = {
     publish: jest.fn().mockResolvedValue(1),
@@ -33,12 +35,21 @@ export function createMockPublisher(): MockPublisher {
       return Promise.resolve(ttls.get(key) ?? -1);
     }),
     get: jest.fn().mockImplementation((key: string) => {
+      const stored = values.get(key);
+      if (stored != null) {
+        return Promise.resolve(stored);
+      }
       const val = counters.get(key);
       return Promise.resolve(val != null ? String(val) : null);
+    }),
+    set: jest.fn().mockImplementation((key: string, value: string) => {
+      values.set(key, value);
+      return Promise.resolve('OK');
     }),
     del: jest.fn().mockImplementation((...keys: string[]) => {
       for (const key of keys) {
         counters.delete(key);
+        values.delete(key);
         ttls.delete(key);
       }
       return Promise.resolve(keys.length);
@@ -57,12 +68,28 @@ export function createMockPublisher(): MockPublisher {
       _numKeys: number,
       seqKey: string,
       jobKey: string,
+      _generationEpochKey: string,
       channel: string,
       prefix: string,
       suffix: string,
       ttlSeconds: string,
+      _expectedGenerationId: string,
+      _allowRetainedEpoch: string,
+      _generationEpochGraceTtl: string,
+      _requireActiveJob: string,
+      sequenceCount = '1',
+      ...chunkSuffixes: string[]
     ) => {
+      if (_numKeys === 1) {
+        const frontier = await publisher.get(seqKey);
+        await publisher.publish(jobKey, _generationEpochKey);
+        return frontier ?? '0';
+      }
+      const count = Number(sequenceCount);
       const val = (await publisher.incr(seqKey)) as number;
+      for (let i = 1; i < count; i++) {
+        await publisher.incr(seqKey);
+      }
       let ttl = Number(ttlSeconds);
       const seqTtl = (await publisher.ttl(seqKey)) as number;
       if (seqTtl < Math.floor(ttl / 2)) {
@@ -73,7 +100,13 @@ export function createMockPublisher(): MockPublisher {
         await publisher.expire(seqKey, ttl);
       }
       const seq = val - 1;
-      await publisher.publish(channel, `${prefix}${seq}${suffix}`);
+      if (chunkSuffixes.length > 0) {
+        for (let i = 0; i < count; i++) {
+          await publisher.publish(channel, `${prefix}${seq + i}${chunkSuffixes[i]}`);
+        }
+      } else {
+        await publisher.publish(channel, `${prefix}${seq}${suffix}`);
+      }
       return seq;
     },
   );

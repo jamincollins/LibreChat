@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import * as s from './schemas';
 
+export const THINKING_BINDING_BETA = 'thinking-binding-controls-2026-08-01';
+
 const DEFAULT_THINKING_BUDGET = 2000;
 const BEDROCK_CLAUDE_SONNET_4_6_MAX_OUTPUT = 64000;
 export const BEDROCK_OUTPUT_128K_BETA = 'output-128k-2025-02-19';
@@ -11,13 +13,18 @@ export const BEDROCK_FINE_GRAINED_TOOL_STREAMING_BETA = 'fine-grained-tool-strea
 const GENERATED_BEDROCK_BETAS = new Set<string>([
   BEDROCK_OUTPUT_128K_BETA,
   BEDROCK_FINE_GRAINED_TOOL_STREAMING_BETA,
+  THINKING_BINDING_BETA,
 ]);
 
 const bedrockReasoningConfigValues = new Set<string>(Object.values(s.BedrockReasoningConfig));
 
 type ThinkingConfig =
   | { type: 'enabled'; budget_tokens: number }
-  | { type: 'adaptive'; display?: s.ThinkingDisplayWireValue }
+  | {
+      type: 'adaptive';
+      display?: s.ThinkingDisplayWireValue;
+      block_binding?: typeof OPUS_55_BLOCK_BINDING;
+    }
   | { type: 'disabled' };
 
 /**
@@ -92,6 +99,17 @@ function parseOpusVersion(model: string): { major: number; minor: number } | nul
   }
   return null;
 }
+
+/** Opus 5.5 has an always-on, conversation-bound thinking contract unlike Opus 5. */
+export function isOpus55Model(model: string): boolean {
+  const opus = parseOpusVersion(model);
+  return opus?.major === 5 && opus.minor === 5;
+}
+
+/** LibreChat permits edits and compaction of earlier turns; drop only invalidated blocks. */
+export const OPUS_55_BLOCK_BINDING = {
+  prefix_mismatch_behavior: 'drop_block',
+} as const;
 
 /** Extracts sonnet major/minor version from both naming formats.
  *  Uses bounded minor capture to avoid matching date suffixes (e.g., -20250514). */
@@ -179,17 +197,90 @@ export function omitsSamplingParameters(model: string): boolean {
  * Whether disabling thinking requires sending an explicit `{ type: 'disabled' }`
  * config rather than simply omitting the `thinking` field.
  *
- * Sonnet 5 treats an omitted `thinking` field as adaptive thinking ON by
- * default, so honoring a user who turns thinking off means sending the disabled
- * config explicitly. Opus 4.7+ run without thinking when the field is omitted,
- * and Fable/Mythos reject an explicit disabled config (400, thinking always
- * on), so both are excluded.
+ * Sonnet 5 and Opus 5 treat an omitted `thinking` field as adaptive thinking ON
+ * by default, so honoring a user who turns thinking off means sending the
+ * disabled config explicitly. Opus 4.7/4.8 run without thinking when the field
+ * is omitted, and Fable/Mythos reject an explicit disabled config (400,
+ * thinking always on), so both are excluded.
  *
  * See https://platform.claude.com/docs/en/about-claude/models/migration-guide#migrating-to-claude-sonnet-5
  */
 export function requiresExplicitThinkingDisabled(model: string): boolean {
+  if (isOpus55Model(model)) {
+    return false;
+  }
   const sonnet = parseSonnetVersion(model);
-  return sonnet != null && sonnet.major >= 5;
+  if (sonnet != null && sonnet.major >= 5) {
+    return true;
+  }
+  const opus = parseOpusVersion(model);
+  return opus != null && opus.major >= 5;
+}
+
+/** Effort levels Opus 5 rejects while thinking is explicitly disabled. */
+const EFFORTS_REJECTED_WHEN_THINKING_DISABLED = new Set<string>([
+  s.AnthropicEffort.xhigh,
+  s.AnthropicEffort.max,
+]);
+
+/**
+ * Whether the model caps `output_config.effort` while thinking is disabled.
+ *
+ * Opus 5 rejects `xhigh`/`max` in that combination with a 400: "output_config
+ * .effort 'xhigh' is not supported when thinking is disabled on this model. Use
+ * effort 'high' or below, or enable thinking." Opus 4.7/4.8, Sonnet 5, and
+ * Sonnet 4.6 accept every effort level they otherwise support with thinking
+ * off, so the cap is Opus 5+ only.
+ */
+export function capsEffortWhenThinkingDisabled(model: string): boolean {
+  if (isOpus55Model(model)) {
+    return false;
+  }
+  const opus = parseOpusVersion(model);
+  return opus != null && opus.major >= 5;
+}
+
+/**
+ * Lowers an effort level the model would reject while thinking is disabled to
+ * the highest accepted value (`high`, which is also the API default). Returns
+ * the effort unchanged when the combination is valid.
+ */
+export function clampEffortForDisabledThinking(model: string, effort: string): string {
+  if (
+    capsEffortWhenThinkingDisabled(model) &&
+    EFFORTS_REJECTED_WHEN_THINKING_DISABLED.has(effort)
+  ) {
+    return s.AnthropicEffort.high;
+  }
+  return effort;
+}
+
+/** An `output_config` container carrying a usable effort level. */
+function hasStringEffort(value: unknown): value is { effort: string } {
+  if (typeof value !== 'object' || value === null || !('effort' in value)) {
+    return false;
+  }
+  return typeof value.effort === 'string';
+}
+
+/**
+ * Clamps an `output_config.effort` in place when the model would reject it
+ * while thinking is disabled. No-op when the container carries no string
+ * effort, so callers can pass a possibly-absent config directly.
+ */
+export function clampOutputConfigEffort(model: string, outputConfig: unknown): void {
+  if (!hasStringEffort(outputConfig)) {
+    return;
+  }
+  outputConfig.effort = clampEffortForDisabledThinking(model, outputConfig.effort);
+}
+
+/** Whether a resolved thinking config is an explicit `{ type: 'disabled' }`. */
+export function isThinkingDisabled(thinking: unknown): boolean {
+  if (typeof thinking !== 'object' || thinking === null || !('type' in thinking)) {
+    return false;
+  }
+  return thinking.type === 'disabled';
 }
 
 /** Checks if a model has a 1M context window (Sonnet 4.6+, Opus 4.6+, Opus 5+, Fable/Mythos) */
@@ -206,6 +297,28 @@ export function supportsContext1m(model: string): boolean {
     return true;
   }
   return false;
+}
+
+/**
+ * Checks whether a native Anthropic Claude model supports prompt caching.
+ *
+ * This uses the configured model ID directly. Resolving it through a token
+ * map first can collapse a newly released Claude model to the generic
+ * `claude-` fallback and incorrectly disable cache control.
+ */
+export function supportsPromptCache(model: string): boolean {
+  if (model.includes('claude-3-5-sonnet-latest') || model.includes('claude-3.5-sonnet-latest')) {
+    return false;
+  }
+
+  return (
+    /claude-3[-.]7/.test(model) ||
+    /claude-3[-.]5-(?:sonnet|haiku)/.test(model) ||
+    /claude-3-(?:sonnet|haiku|opus)?/.test(model) ||
+    /claude-(?:sonnet|opus|haiku)[-.]?(?:[4-9]|\d{2,})/.test(model) ||
+    /claude-(?:[4-9]|\d{2,})(?:[-.](?:sonnet|opus|haiku))?/.test(model) ||
+    s.isMythosClassModel(model)
+  );
 }
 
 /**
@@ -232,6 +345,9 @@ function isBedrockClaudeModel(model: string): boolean {
  * @returns Array of beta header strings, or empty array if not applicable
  */
 function getBedrockAnthropicBetaHeaders(model: string): string[] {
+  if (isOpus55Model(model)) {
+    return [THINKING_BINDING_BETA];
+  }
   const betaHeaders: string[] = [];
 
   /** Mythos-class (Fable/Mythos) is intentionally not matched: these betas are built-in/no-op for the
@@ -458,6 +574,8 @@ export const bedrockInputParser = s.tConversationSchema
         const persistedAmrf = typedData.additionalModelRequestFields as
           | Record<string, unknown>
           | undefined;
+        const thinkingDisabled =
+          additionalFields.thinking === false && !isOpus55Model(typedData.model as string);
         const effort = additionalFields.effort;
         if (typeof effort === 'string' && effort !== '') {
           additionalFields.output_config = { effort };
@@ -469,7 +587,19 @@ export const bedrockInputParser = s.tConversationSchema
         }
         delete additionalFields.effort;
 
-        if (additionalFields.thinking === false) {
+        /**
+         * Opus 5 rejects `xhigh`/`max` effort while thinking is disabled, so
+         * clamp both the effort derived above and any effort still carried in
+         * persisted AMRF (agent resume sends `output_config` with no top-level
+         * `effort`, so the branch above leaves it untouched).
+         */
+        if (thinkingDisabled) {
+          [additionalFields, persistedAmrf].forEach((target) =>
+            clampOutputConfigEffort(typedData.model as string, target?.output_config),
+          );
+        }
+
+        if (thinkingDisabled) {
           delete additionalFields.thinkingBudget;
           delete additionalFields.thinkingDisplay;
           if (requiresExplicitThinkingDisabled(typedData.model as string)) {
@@ -498,6 +628,9 @@ export const bedrockInputParser = s.tConversationSchema
             | undefined;
           const persistedDisplay = extractPersistedDisplay(typedData.additionalModelRequestFields);
           const thinkingConfig: ThinkingConfig = { type: 'adaptive' };
+          if (isOpus55Model(typedData.model as string)) {
+            thinkingConfig.block_binding = { ...OPUS_55_BLOCK_BINDING };
+          }
           const display = resolveThinkingDisplay(
             typedData.model as string,
             topLevelDisplay ?? persistedDisplay,
